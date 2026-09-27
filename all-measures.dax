@@ -1,0 +1,157 @@
+// DAX Measures Library - all measures in one file for copy/paste into Tabular Editor or Power BI.
+// Model: star schema from https://github.com/Shashan4321/sales-intelligence-powerbi
+
+// ===== 01 · Base measures =====
+Total Revenue =
+CALCULATE ( SUM ( fact_sales[net_revenue] ), fact_sales[is_returned] = FALSE () )
+
+Orders =
+CALCULATE ( DISTINCTCOUNT ( fact_sales[order_id] ), fact_sales[is_returned] = FALSE () )
+
+Avg Order Value = DIVIDE ( [Total Revenue], [Orders] )
+
+Gross Margin % =
+VAR _rev  = [Total Revenue]
+VAR _cost = CALCULATE ( SUM ( fact_sales[cost] ), fact_sales[is_returned] = FALSE () )
+RETURN DIVIDE ( _rev - _cost, _rev )
+
+Discount % =
+DIVIDE (
+    SUM ( fact_sales[discount_amount] ),
+    SUM ( fact_sales[discount_amount] ) + SUM ( fact_sales[net_revenue] )
+)
+
+Return Rate % =
+DIVIDE (
+    CALCULATE ( COUNTROWS ( fact_sales ), fact_sales[is_returned] = TRUE () ),
+    COUNTROWS ( fact_sales )
+)
+
+// ===== 02 · Time intelligence: YoY, MoM, YTD, QTD, MTD, Indian FY =====
+Revenue PY = CALCULATE ( [Total Revenue], SAMEPERIODLASTYEAR ( dim_date[date] ) )
+
+Revenue YoY % =
+VAR _cur = [Total Revenue]
+VAR _py  = [Revenue PY]
+RETURN IF ( NOT ISBLANK ( _py ), DIVIDE ( _cur - _py, _py ) )
+
+Revenue PM = CALCULATE ( [Total Revenue], DATEADD ( dim_date[date], -1, MONTH ) )
+
+Revenue MoM % = DIVIDE ( [Total Revenue] - [Revenue PM], [Revenue PM] )
+
+Revenue YTD = TOTALYTD ( [Total Revenue], dim_date[date] )
+Revenue QTD = TOTALQTD ( [Total Revenue], dim_date[date] )
+Revenue MTD = TOTALMTD ( [Total Revenue], dim_date[date] )
+
+Revenue YTD PY = CALCULATE ( [Revenue YTD], SAMEPERIODLASTYEAR ( dim_date[date] ) )
+
+Revenue YTD YoY % = DIVIDE ( [Revenue YTD] - [Revenue YTD PY], [Revenue YTD PY] )
+
+Revenue FYTD = TOTALYTD ( [Total Revenue], dim_date[date], "31/3" )
+
+// ===== 03 · Running totals and rolling averages =====
+Revenue Running Total =
+VAR _maxDate = MAX ( dim_date[date] )
+RETURN
+    CALCULATE ( [Total Revenue], dim_date[date] <= _maxDate, REMOVEFILTERS ( dim_date ) )
+
+Revenue Running Total (Year) =
+CALCULATE ( [Total Revenue], DATESYTD ( dim_date[date] ) )
+
+Revenue 3M Rolling Avg =
+VAR _months = DATESINPERIOD ( dim_date[date], MAX ( dim_date[date] ), -3, MONTH )
+RETURN DIVIDE ( CALCULATE ( [Total Revenue], _months ), 3 )
+
+// ===== 04 · Ranking, Top N, Pareto and share of parent =====
+Category Rank =
+IF (
+    HASONEVALUE ( dim_product[category] ),
+    RANKX ( ALL ( dim_product[category] ), [Total Revenue],, DESC, DENSE )
+)
+
+Top N Revenue =
+VAR _n = SELECTEDVALUE ( 'Top N'[Top N], 5 )
+RETURN IF ( [Category Rank] <= _n, [Total Revenue] )
+
+Cumulative Share % =
+VAR _cur = [Total Revenue]
+VAR _all = CALCULATE ( [Total Revenue], ALLSELECTED ( dim_product[category] ) )
+VAR _cum =
+    SUMX (
+        FILTER (
+            ALLSELECTED ( dim_product[category] ),
+            [Total Revenue] >= _cur
+        ),
+        [Total Revenue]
+    )
+RETURN DIVIDE ( _cum, _all )
+
+Revenue Share of Parent =
+VAR _parent =
+    SWITCH (
+        TRUE (),
+        ISINSCOPE ( dim_store[store_name] ), CALCULATE ( [Total Revenue], ALLSELECTED ( dim_store[store_name] ) ),
+        ISINSCOPE ( dim_store[city] ),       CALCULATE ( [Total Revenue], ALLSELECTED ( dim_store[city] ) ),
+        ISINSCOPE ( dim_store[state] ),      CALCULATE ( [Total Revenue], ALLSELECTED ( dim_store[state] ) ),
+        CALCULATE ( [Total Revenue], ALLSELECTED ( dim_store[country] ) )
+    )
+RETURN DIVIDE ( [Total Revenue], _parent )
+
+// ===== 05 · Customer analytics: new, returning, active =====
+Active Customers =
+CALCULATE ( DISTINCTCOUNT ( fact_sales[customer_key] ), fact_sales[is_returned] = FALSE () )
+
+New Customers =
+VAR _start = MIN ( dim_date[date] )
+VAR _end   = MAX ( dim_date[date] )
+RETURN
+    COUNTROWS (
+        FILTER (
+            VALUES ( fact_sales[customer_key] ),
+            VAR _first = CALCULATE ( MIN ( dim_date[date] ), REMOVEFILTERS ( dim_date ) )
+            RETURN _first >= _start && _first <= _end
+        )
+    )
+
+Returning Customers = [Active Customers] - [New Customers]
+
+// ===== 06 · Semi-additive measures (stock, balances) =====
+Closing Stock Value =
+VAR _last = MAX ( fact_inventory_monthly[year_month] )
+RETURN
+    CALCULATE (
+        SUM ( fact_inventory_monthly[closing_value] ),
+        fact_inventory_monthly[year_month] = _last
+    )
+
+Closing Balance =
+CALCULATE (
+    SUM ( fact_balance[amount] ),
+    LASTNONBLANK ( dim_date[date], CALCULATE ( SUM ( fact_balance[amount] ) ) )
+)
+
+// ===== 07 · Row-level security (RLS) =====
+// ===== 08 · Calculation groups, what-if and dynamic formatting =====
+Revenue Scenario =
+[Total Revenue] * ( 1 + SELECTEDVALUE ( 'Price Change %'[Price Change %], 0 ) )
+
+Selected KPI =
+SWITCH (
+    SELECTEDVALUE ( 'KPI Selector'[KPI] ),
+    "Revenue", [Total Revenue],
+    "Orders", [Orders],
+    "AOV", [Avg Order Value],
+    "Margin %", [Gross Margin %],
+    [Total Revenue]
+)
+
+Revenue (Indian format) =
+VAR _v = [Total Revenue]
+RETURN
+    SWITCH (
+        TRUE (),
+        _v >= 1e7, FORMAT ( _v / 1e7, "₹#,0.00" ) & " Cr",
+        _v >= 1e5, FORMAT ( _v / 1e5, "₹#,0.00" ) & " L",
+        FORMAT ( _v, "₹#,0" )
+    )
+
